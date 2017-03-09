@@ -1,30 +1,64 @@
 #include <assert.h>
-#include <err.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+static void fprintargv(FILE *fp, int argc, char **argv)
+{
+	fputs(*argv, fp);
+	argc--;
+	argv++;
+
+	for (; argc; argc--, argv++) {
+		fputc(' ', fp);
+		fputs(*argv, fp);
+	}
+}
+
+
 typedef struct action {
 	const char *name;
+	const char *usage;
 
 	int (*exec)(int argc, char **argv, void **buf, size_t *buflen);
 } action_t;
+
+static void action_usage(const action_t *act)
+{
+	fprintf(stderr, "%s %s", act->name, act->usage);
+}
 
 static int action_exec(const action_t *acts, int argc, char **argv,
 		       void **buf, size_t *buflen)
 {
 	const action_t *act;
+	int err;
 
 	for (act = acts; act->name; act++) {
-		if (strcmp(act->name, *argv))
-			continue;
-
-		return act->exec(argc - 1, argv + 1, buf, buflen);
+		if (!strcmp(act->name, *argv))
+			break;
 	}
 
-	errx(1, "unknown action '%s'", *argv);
-	return -1;
+	if (!act->name) {
+		fputs("unknown expression '", stderr);
+		fprintargv(stderr, argc, argv);
+		fputs("'\n", stderr);
+		return -ENOENT;
+	}
+
+	err = act->exec(argc, argv, buf, buflen);
+	if (err) {
+		fputs("malformed expression '", stderr);
+		fprintargv(stderr, argc, argv);
+		fputs("'\nusage: ", stderr);
+		action_usage(act);
+		fputc('\n', stderr);
+		return err;
+	}
+
+	return 0;
 }
 
 
@@ -44,6 +78,8 @@ int hex_exec(int argc, char **argv, void **buf, size_t *buflen)
 {
 	char *data;
 
+	argc--;
+	argv++;
 	if (!argc)
 		return 0;
 
@@ -51,8 +87,10 @@ int hex_exec(int argc, char **argv, void **buf, size_t *buflen)
 		long int byte;
 
 		byte = strtol(*argv, NULL, 16);
-		if (byte < 0 || byte >= 0x100)
-			errx(1, "hex: invalid byte '%s'", *argv);
+		if (byte < 0 || byte >= 0x100) {
+			fprintf(stderr, "hex: invalid byte '%s'\n", *argv);
+			return -EINVAL;
+		}
 
 		*data = byte;
 	}
@@ -65,12 +103,14 @@ int pad_exec(int argc, char **argv, void **buf, size_t *buflen)
 	long int len;
 	char *data;
 
+	argc--;
+	argv++;
 	if (argc != 1)
-		errx(1, "pad: expected one argument (len), got %d", argc);
+		return -EINVAL;
 
 	len = strtol(*argv, NULL, 0);
 	if (len < 0)
-		errx(1, "pad: invalid len '%s'", *argv);
+		return -EINVAL;
 
 	len = len - (*buflen % len);
 	if (!len)
@@ -86,12 +126,14 @@ int zero_exec(int argc, char **argv, void **buf, size_t *buflen)
 	long int len;
 	char *data;
 
+	argc--;
+	argv++;
 	if (argc != 1)
-		errx(1, "zero: expected one argument (len), got %d", argc);
+		return -EINVAL;
 
 	len = strtol(*argv, NULL, 0);
 	if (len < 0)
-		errx(1, "zero: invalid len '%s'", *argv);
+		return -EINVAL;
 
 	data = add(buf, buflen, len);
 	memset(data, 0, len);
@@ -105,8 +147,10 @@ int mac_exec(int argc, char **argv, void **buf, size_t *buflen)
 	char *mac = add(buf, buflen, MAC_LEN);
 	int ret;
 
+	argc--;
+	argv++;
 	if (argc != 1)
-		errx(1, "mac: expected one argument (address), got %d", argc);
+		return -EINVAL;
 
 	if (!strcmp(*argv, "bc") || !strcmp(*argv, "broadcast")) {
 		memset(mac, 0xff, MAC_LEN);
@@ -128,7 +172,7 @@ int mac_exec(int argc, char **argv, void **buf, size_t *buflen)
 	ret = sscanf(*argv, MAC_FMT,
 		     &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
 	if (ret != MAC_LEN)
-		errx(1, "mac: unknown address '%s'", *argv);
+		return -EINVAL;
 
 	return 0;
 }
@@ -139,15 +183,17 @@ int vlan_exec(int argc, char **argv, void **buf, size_t *buflen)
 	char *vlan = add(buf, buflen, VLAN_HLEN);
 	long int vid;
 
+	argc--;
+	argv++;
 	if (argc != 1)
-		errx(1, "vlan: expected one argument (vid), got %d", argc);
+		return -EINVAL;
 
 	vlan[0] = 0x81;
 	vlan[1] = 0x00;
 
 	vid = strtol(*argv, NULL, 0);
 	if (vid < 0 || vid >= 4096)
-		errx(1, "vlan: vid out of range, '%s'", *argv);
+		return -EINVAL;
 
 	vlan[2] = vid >> 8;
 	vlan[3] = vid & 0xff;
@@ -156,15 +202,15 @@ int vlan_exec(int argc, char **argv, void **buf, size_t *buflen)
 
 static const action_t actions[] = {
 	/* common */
-	{ .name = "hex",  .exec = hex_exec },
-	{ .name = "x",    .exec = hex_exec },
-	{ .name = "pad",  .exec = pad_exec },
-	{ .name = "zero", .exec = zero_exec },
-	{ .name = "z",    .exec = zero_exec },
+	{ .name = "hex",  .usage = "[<byte> ... ]",  .exec = hex_exec },
+	{ .name = "x",    .usage = "[<byte> ... ]",  .exec = hex_exec },
+	{ .name = "pad",  .usage = "<len> [<byte>]", .exec = pad_exec },
+	{ .name = "zero", .usage = "<len>",          .exec = zero_exec },
+	{ .name = "z",    .usage = "<len>",          .exec = zero_exec },
 
 	/* ethernet */
-	{ .name = "mac",  .exec = mac_exec },
-	{ .name = "vlan", .exec = vlan_exec },
+	{ .name = "mac",  .usage = "bc | random | <mac>", .exec = mac_exec },
+	{ .name = "vlan", .usage = "<vid>",               .exec = vlan_exec },
 
 	/* term */
 	{ .name = NULL }
@@ -174,7 +220,7 @@ int main(int argc, char **argv)
 {
 	void *buf = NULL;
 	size_t buflen = 0;
-	int error, aargc;
+	int err, aargc;
 
 	srand(time(0));
 	
@@ -182,7 +228,8 @@ int main(int argc, char **argv)
 	argv++;
 
 	while (argc > 0) {
-		for (aargc = 0; aargc < argc && strcmp(argv[aargc], "^"); aargc++);
+		for (aargc = 0; aargc < argc && strcmp(argv[aargc], "^");)
+			aargc++;
 
 		if (!aargc) {
 			argc--;
@@ -190,20 +237,21 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		error = action_exec(actions, aargc, argv, &buf, &buflen);
-		if (error)
-			exit(1);
+		err = action_exec(actions, aargc, argv, &buf, &buflen);
+		if (err)
+			break;
 
 		argc -= aargc + 1;
 		argv += aargc + 1;
 	}
 
-	if (buf) {
-		if (fwrite(buf, buflen, 1, stdout) != 1)
-			err(1, "unable to write packet to stdout");
-
-		free(buf);
+	if (buf && !err && fwrite(buf, buflen, 1, stdout) != 1) {
+		err = -EIO;
+		fprintf(stderr, "err: unable to write bytes to stdout");
 	}
 
-	return 0;
+	if (buf)
+		free(buf);
+
+	return err ? 1 : 0;
 }
